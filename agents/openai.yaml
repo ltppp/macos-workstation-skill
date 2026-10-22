@@ -1,0 +1,4 @@
+interface:
+  display_name: "macOS 虚拟机工作站"
+  short_description: "创建与重建独立 macOS 工作站，强制验收代理、断流保护、共享和剪贴板"
+  default_prompt: "使用 $macos-workstation 创建或维护独立 macOS 工作站，保留旧环境并完成强制代理隔离验收。"

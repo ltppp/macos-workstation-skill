@@ -1,0 +1,50 @@
+ObjC.import('AppKit');
+ObjC.import('Foundation');
+function run(args) {
+  const pb = $.NSPasteboard.generalPasteboard;
+  const allowed = ['public.utf8-plain-text', 'public.utf16-external-plain-text',
+    'public.png', 'public.tiff', 'public.rtf', 'public.html', 'public.url', 'public.url-name'];
+  const count = () => Number(pb.changeCount);
+  if (args[0] === 'read') {
+    const current = count();
+    if (String(current) === args[1]) return JSON.stringify({count: current});
+    const allTypes = ObjC.deepUnwrap(pb.types) || [];
+    if (allTypes.some(t => /ConcealedType|TransientType|onepassword/i.test(t)))
+      return JSON.stringify({count: current, skipped: 'sensitive'});
+    const items = [];
+    let total = 0;
+    const native = pb.pasteboardItems;
+    for (let i = 0; i < Number(native.count); i++) {
+      const item = native.objectAtIndex(i), out = {};
+      for (const type of allowed) {
+        if (!(ObjC.deepUnwrap(item.types) || []).includes(type)) continue;
+        const data = item.dataForType(type);
+        total += Number(data.length);
+        if (total > 4 * 1024 * 1024) return JSON.stringify({count: current, skipped: 'size'});
+        out[type] = ObjC.unwrap(data.base64EncodedStringWithOptions(0));
+      }
+      if (Object.keys(out).length) items.push(out);
+    }
+    if (allTypes.length && !items.length) return JSON.stringify({count: current, skipped: 'unsupported'});
+    return JSON.stringify({count: current, items});
+  }
+  if (args[0] === 'write') {
+    const raw = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+    const payload = JSON.parse(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(raw, $.NSUTF8StringEncoding)));
+    if (!Array.isArray(payload.items) || Number(raw.length) > 6 * 1024 * 1024) throw Error('Invalid clipboard payload');
+    const items = [];
+    for (const value of payload.items) {
+      const item = $.NSPasteboardItem.alloc.init;
+      for (const type of Object.keys(value)) {
+        if (!allowed.includes(type)) throw Error('Unsupported clipboard format');
+        const data = $.NSData.alloc.initWithBase64EncodedStringOptions(value[type], 0);
+        item.setDataForType(data, type);
+      }
+      items.push(item);
+    }
+    pb.clearContents;
+    if (items.length && !pb.writeObjects($(items))) throw Error('Clipboard write failed');
+    return JSON.stringify({count: count()});
+  }
+  throw Error('Expected read or write');
+}

@@ -1,0 +1,18 @@
+{
+  "profile": "mac-work-01",
+  "guest_user": "worker",
+  "limactl": "~/.local/opt/lima-2.3.0-beta.1/bin/limactl",
+  "limactl_sha256": "REPLACE_WITH_VERIFIED_OFFICIAL_BINARY_SHA256",
+  "singbox": "~/.local/opt/sing-box-1.14.3/sing-box",
+  "singbox_sha256": "REPLACE_WITH_VERIFIED_OFFICIAL_BINARY_SHA256",
+  "ipsw": "~/Downloads/verified-macOS.ipsw",
+  "ipsw_sha256": "REPLACE_WITH_COMPLETE_OFFICIAL_IPSW_SHA256",
+  "node_file": "~/.config/macvm-workstation/node.txt",
+  "expected_exit_ipv4": "192.0.2.10",
+  "probe_port": 28080,
+  "socks_port": 28081,
+  "host_proxy_probe_port": 7890,
+  "shares": [
+    {"source": "~/VMWork", "target": "/Users/worker/work", "writable": true}
+  ]
+}

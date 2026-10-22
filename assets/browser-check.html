@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>Browser privacy checks</title>
+<style>body{font:18px system-ui;max-width:960px;margin:50px auto;background:#f7f8fa}pre{white-space:pre-wrap;background:white;padding:24px}</style>
+<h1>浏览器网络与 WebGL 实测</h1><p>只读取网页可访问的信息，不申请摄像头或麦克风权限，不修改浏览器设置。结果只回传本机。</p><pre id="out">检查中，约 20 秒……</pre>
+<script>
+(async()=>{
+ const r={time:new Date().toISOString(),userAgent:navigator.userAgent,hardwareConcurrency:navigator.hardwareConcurrency,webgl:{},webrtc:[],network:{}};
+ for(const kind of ['webgl','webgl2']){try{const gl=document.createElement('canvas').getContext(kind);if(!gl){r.webgl[kind]={available:false};continue}const ext=gl.getExtension('WEBGL_debug_renderer_info');r.webgl[kind]={available:true,vendor:gl.getParameter(gl.VENDOR),renderer:gl.getParameter(gl.RENDERER),unmaskedVendor:ext?gl.getParameter(ext.UNMASKED_VENDOR_WEBGL):null,unmaskedRenderer:ext?gl.getParameter(ext.UNMASKED_RENDERER_WEBGL):null,maxTextureSize:gl.getParameter(gl.MAX_TEXTURE_SIZE)};}catch(e){r.webgl[kind]={error:e.name}}}
+ async function ice(url){const pc=new RTCPeerConnection({iceServers:[{urls:url}]});const x={server:url,candidates:[],errors:[]};pc.onicecandidate=e=>{if(e.candidate)x.candidates.push(e.candidate.toJSON())};pc.onicecandidateerror=e=>x.errors.push({code:e.errorCode,text:e.errorText});pc.createDataChannel('check');await pc.setLocalDescription(await pc.createOffer());await new Promise(resolve=>{let t=setTimeout(resolve,15000);pc.onicegatheringstatechange=()=>{if(pc.iceGatheringState==='complete'){clearTimeout(t);resolve()}}});x.gatheringState=pc.iceGatheringState;pc.close();r.webrtc.push(x)}
+ async function trace(){try{const res=await fetch('https://www.cloudflare.com/cdn-cgi/trace?check='+Date.now(),{cache:'no-store',signal:AbortSignal.timeout(12000)});const t=await res.text();r.network.https={ok:res.ok,ip:t.match(/^ip=(.*)$/m)?.[1],loc:t.match(/^loc=(.*)$/m)?.[1]}}catch(e){r.network.https={ok:false,error:e.name}}}
+ await Promise.all([trace(),ice('stun:stun.l.google.com:19302'),ice('stun:stun.cloudflare.com:3478')]);
+ try{const a=await navigator.gpu?.requestAdapter();if(a)r.webgpu=Object.fromEntries(['vendor','architecture','device','description','isFallbackAdapter'].map(k=>[k,a.info[k]]))}catch(e){r.webgpu={error:e.name}}
+ document.querySelector('#out').textContent=JSON.stringify(r,null,2);await fetch(location.pathname+'report',{method:'POST',body:JSON.stringify(r),headers:{'Content-Type':'application/json'}});document.title='Browser checks collected';
+})().catch(e=>{document.querySelector('#out').textContent=e.stack});
+</script>

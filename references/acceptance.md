@@ -1,0 +1,43 @@
+# 强制验收与失效规则
+
+用户要求代理检查强制执行。不能只靠 Agent 自觉勾选：生命周期脚本在检查失败时返回非零，拒绝 shell/正常 start，并尝试保留 PF、停止客户机代理；无法确认时正常停止候选。管理员手工绕开脚本不在保证范围内。
+
+## 三阶段
+
+```sh
+python3 scripts/workstation.py --config /absolute/private/profile.json accept
+# 冷启动后用户登录客户机桌面，确保普通 Google Chrome 已安装。
+python3 scripts/workstation.py --config /absolute/private/profile.json finish-acceptance
+# 用户实际测试宿主→客户机、客户机→宿主复制粘贴，确认正常后：
+python3 scripts/workstation.py --config /absolute/private/profile.json confirm-ui
+```
+
+最后一条只能在收到用户实际确认后执行，不是跳过 UI 的开关。阶段证据有效期 1 小时，过期重跑；配置、节点、代码或客户机 UUID 变化都会拒绝沿用。
+
+## 系统自动检查
+
+- 当前 guest UUID 哈希（不打印 UUID），固定官方依赖哈希/版本。
+- 专用代理物理接口绑定和节点主机路由，不使用 utun；出口符合用户明确指定地址。
+- 宿主其他代理可用时与专用出口不同；没有代理必须检查进程确实不存在。
+- PF enabled、受限上游通道、最终阻断；Ethernet 持久 IPv4/IPv6 inactive，已安装脚本和受限客户机配置 SHA-256 与当前包一致。
+- HTTPS、DNS 正常；强制 en0、IPv6、普通用户访问宿主代理/SOCKS/DNS 必须阻断。
+- 代理停止/上游阻断：HTTPS 与未缓存随机 DNS 必须失败。SSH 不通、命令不存在、未产生检查报告不能作为阻断成功。故障操作必须恢复；恢复失败立即失败，不留成功报告。
+- 正常 stop/start，重新检查全部在线项、防火墙、实例身份和各共享读写策略。
+
+## 浏览器与剪贴板
+
+实际客户机 Chrome 访问本机临时检查页；收集服务仅监听回环，经独立 SSH 转发，完成/失败都关闭。不是 headless 替身，也不在登录站点注入脚本。
+
+- HTTPS 返回指定出口；Google 和 Cloudflare 两台 STUN 均必须收到指定节点 srflx 地址。
+- 不接受原始局域网/其他出口 ICE 地址；无媒体授权情况下的 host 候选应为 mDNS。
+- WebGL 1/2 可用并记录 renderer；虚拟 GPU 标识是事实，不是失败判据，更不是需要伪造的值。
+- STUN 收集错误仍写入报告，不能因有效候选存在而声称零错误。
+- 剪贴板自动检查保留原内容在内存并恢复；敏感/无法完整保存内容则停止，不覆盖用户剪贴板。端点测试之外，必须用户实测冷启动后的双向同步。
+
+## 报告与日常门禁
+
+报告只放私有 profile 状态目录，公开仓库只保留测试方法和脱敏摘要。`accepted.json` 是本机操作收据，不是签名安全证明。`start`、`shell`、`check` 必须实时重跑网络门禁；已有收据不代表当前网络必然正确。关闭实例用 `stop`，不会关闭其他工作站的宿主代理。
+
+## 不得扩大的结论
+
+运行/冷启动检查不是从通电首条指令的连续抓包。浏览器无媒体权限的 STUN 不代表所有权限场景；没有自有权威 DNS 域名时，不宣称已查明所有递归 DNS 的实际出口。休眠唤醒、系统升级、断网切换 Wi-Fi、跨系统 flock、Apple 账户及 Claude 登录是独立项目，未测就标未测。公开版本首次端到端验收仍待完成。

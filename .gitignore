@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+*.log
+private/
+state/
+reports/
+*.ipsw
+*.dmg
+node.txt
+profile.local.json
