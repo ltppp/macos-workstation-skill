@@ -19,6 +19,9 @@ function run(args) {
       for (const type of allowed) {
         if (!(ObjC.deepUnwrap(item.types) || []).includes(type)) continue;
         const data = item.dataForType(type);
+        // Apps can advertise a promised format but return nil when asked for it.
+        // Do not overwrite a clipboard that cannot be fully preserved.
+        if (data.isNil()) return JSON.stringify({count: current, skipped: 'unavailable-format'});
         total += Number(data.length);
         if (total > 4 * 1024 * 1024) return JSON.stringify({count: current, skipped: 'size'});
         out[type] = ObjC.unwrap(data.base64EncodedStringWithOptions(0));

@@ -3,6 +3,7 @@
 import argparse
 import base64
 import hashlib
+import fcntl
 import http.server
 import ipaddress
 import json
@@ -13,6 +14,7 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -23,6 +25,10 @@ REQUIRED = {'profile', 'guest_user', 'limactl', 'limactl_sha256', 'singbox', 'si
             'ipsw', 'ipsw_sha256', 'node_file', 'expected_exit_ipv4', 'probe_port', 'socks_port',
             'host_proxy_probe_port', 'shares'}
 HEX = re.compile(r'[a-f0-9]{64}')
+
+
+class PreparationRequired(RuntimeError):
+    """An interactive prerequisite; existing evidence is preserved, not accepted."""
 
 
 def require(ok, message):
@@ -92,6 +98,8 @@ class Workstation:
         self.c = config
         self.state = (Path.home() / '.local/share/macvm-skill' / config['profile']).resolve()
         self.lima = self.state / 'lima'
+        require(len(os.fsencode(str(self.lima / config['profile'] / 'ssh.sock.1234567890123456'))) < 104,
+                'Profile name makes the Lima UNIX socket path too long; use a shorter profile name')
         self.runtime = self.state / 'runtime'
         self.env = dict(os.environ, LIMA_HOME=str(self.lima))
         for s in config['shares']:
@@ -119,7 +127,10 @@ class Workstation:
 
     def script(self, name, *args, timeout=180):
         r = self.run([sys.executable, self.runtime / 'scripts' / name, *args], timeout=timeout)
-        require(r.returncode == 0, name + ' failed; see local private audit report')
+        if r.returncode:
+            log=self.state/(name+'.error.log')
+            log.write_bytes(r.stdout + b'\n' + r.stderr);log.chmod(0o600)
+        require(r.returncode == 0, name + ' failed; see private '+name+'.error.log')
         return r.stdout
 
     def fingerprint(self):
@@ -202,13 +213,103 @@ class Workstation:
         ips=re.findall(rb'^ip=(.*)$',r.stdout,re.M)
         require(r.returncode==0 and ips==[self.c['expected_exit_ipv4'].encode()], 'Host proxy exit differs from the explicitly expected address')
 
+    def creation_record(self):
+        path = self.state / 'creation.json'
+        require(not self.receipt.exists(), 'Already accepted; use start, not bootstrap')
+        if path.exists():
+            record = json.loads(path.read_text())
+            require(record['fingerprint'] == self.fingerprint(),
+                    'Creation configuration or code changed; retain the instance for explicit review')
+            require(record['phase'] in ('prepared', 'creating', 'created', 'staged'), 'Unknown creation phase')
+            return record
+        require(not self.state.exists(), 'Untracked state exists; retain it for explicit review')
+        return {'fingerprint': self.fingerprint(), 'phase': 'prepared'}
+
+    def creation_preflight(self, record):
+        self.prerequisites(image=True)
+        fresh = record['phase'] in ('prepared', 'creating')
+        parent = self.state.parent
+        while not parent.exists():
+            parent = parent.parent
+        # Conservative working-space allowance; sparse disk capacity is not free space.
+        needed = (Path(self.c['ipsw']).stat().st_size + 32 * 1024**3) if fresh else 8 * 1024**3
+        require(shutil.disk_usage(parent).free >= needed,
+                'Insufficient free disk space for installation; retain existing disks and free space first')
+        if not self.state.exists():
+            for port in (self.c['probe_port'], self.c['socks_port']):
+                with socket.socket() as sock:
+                    try:
+                        sock.bind(('0.0.0.0', port))
+                    except OSError:
+                        raise RuntimeError(f'Host port {port} is occupied; choose a free port') from None
+        print('Preflight passed: pinned dependencies, full image hash, disk space and fresh-profile ports.', flush=True)
+
     def bootstrap(self):
-        require(not (self.lima/self.c['profile']).exists(), 'Instance exists; bootstrap never overwrites or recreates it')
-        self.prerequisites(image=True);self.render();self.proxy();self.invalidate()
-        require(self.lima_cmd(['create','--name='+self.c['profile'],str(self.state/'instance.yaml')],timeout=180).returncode==0,'Lima create failed')
-        require(self.lima_cmd(['start','--tty=false',self.c['profile']],timeout=3600).returncode==0,'Bootstrap failed')
-        print('BOOTSTRAP ONLY: no acceptance. Do not browse or sign in until network installation and accept pass.')
-        self.script('macos-network-stage.py','--open')
+        record = self.creation_record()
+        vm = self.lima / self.c['profile']
+        require(not vm.exists() or record['phase'] in ('created', 'staged'),
+                'System creation was interrupted; disk retained, automatic recreation refused')
+        self.creation_preflight(record)
+        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (self.state / 'creation.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('Another creation operation is running for this profile') from None
+            # Recheck after locking: never create twice or adopt an unrelated instance.
+            checkpoint = self.state / 'creation.json'
+            if checkpoint.exists():
+                record = self.creation_record()
+            require(not vm.exists() or record['phase'] in ('created', 'staged'),
+                    'Interrupted creation requires review; no disk was deleted')
+            private_json(checkpoint, record)
+            try:
+                self.render(); self.proxy(); self.invalidate()
+                if record['phase'] in ('prepared', 'creating'):
+                    record['phase'] = 'creating'; private_json(checkpoint, record)
+                    print('Creating macOS; this can take up to one hour.', flush=True)
+                    created = self.lima_cmd(['create', '--name='+self.c['profile'], str(self.state/'instance.yaml')], timeout=3600)
+                    if created.returncode:
+                        log = self.state/'create-error.log'; log.write_bytes(created.stderr); log.chmod(0o600)
+                    require(created.returncode == 0, 'Lima create failed; inspect private create-error.log')
+                    record['phase'] = 'created'; private_json(checkpoint, record)
+                require(vm.is_dir(), 'Created instance is missing; automatic recreation refused')
+                print('Starting existing disk and staging network installer.', flush=True)
+                require(self.lima_cmd(['start', '--tty=false', self.c['profile']], timeout=3600).returncode == 0,
+                        'Startup failed; rerun bootstrap to resume this disk')
+                print(self.script('macos-network-stage.py', '--open').decode().strip())
+                record['phase'] = 'staged'; private_json(checkpoint, record)
+                print('BOOTSTRAP ONLY: complete network installation and acceptance before browsing or signing in.')
+            except (Exception, KeyboardInterrupt):
+                # PF may not exist yet. Always request a normal VM stop here.
+                self.invalidate()
+                if vm.exists():
+                    try:
+                        stopped = self.lima_cmd(['stop', self.c['profile']], timeout=120)
+                        require(stopped.returncode == 0, 'Normal stop failed')
+                    except Exception:
+                        print('ATTENTION: candidate shutdown could not be confirmed; do not use it. No force stop attempted.', file=sys.stderr)
+                raise
+
+    def desktop_preflight(self):
+        if self.checked_guest(['stat', '-f', '%Su', '/dev/console']).decode().strip() != self.c['guest_user']:
+            raise PreparationRequired('Log in to the guest desktop, then repeat this command; evidence retained')
+        chrome = self.guest(['sh', '-c', 'test -d "/Applications/Google Chrome.app" || test -d "$HOME/Applications/Google Chrome.app"'])
+        if chrome.returncode != 0:
+            raise PreparationRequired('Install Google Chrome in the guest, then repeat this command; evidence retained')
+        agents = self.run(['launchctl', 'list'])
+        require(agents.returncode == 0, 'Cannot inspect clipboard services')
+        own = 'local.macvm-skill.' + self.c['profile'] + '.clipboard'
+        labels = [line.split()[-1] for line in agents.stdout.decode().splitlines() if line.split()]
+        if any(label != own and (label == 'local.macos-workstation.clipboard' or
+                label.startswith('local.macvm-skill.') and label.endswith('.clipboard')) for label in labels):
+            raise PreparationRequired('Another clipboard bridge is active; stop it before candidate acceptance')
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('clipboard_preflight', self.runtime/'scripts/macos-clipboard.py')
+        bridge = importlib.util.module_from_spec(spec); spec.loader.exec_module(bridge)
+        content = bridge.call(False, 'read')
+        if 'items' not in content:
+            raise PreparationRequired('Copy ordinary text on the host, then repeat this command; clipboard and evidence retained')
 
     def network(self, faults=False):
         args=['--faults'] if faults else []
@@ -270,6 +371,10 @@ class Workstation:
         require(not any(label != own and (label.startswith('local.macvm-skill.') and label.endswith('.clipboard') or label == 'local.macos-workstation.clipboard') for label in labels), 'Another workstation clipboard bridge is loaded; explicitly stop it before candidate clipboard acceptance')
         spec=importlib.util.spec_from_file_location('bridge',self.runtime/'scripts/macos-clipboard.py')
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        # Stage the endpoint without starting synchronization or changing clipboard contents.
+        helper = '/Users/' + self.c['guest_user'] + '/.local/libexec/macos-clipboard.jxa'
+        self.checked_guest(['sh','-c','umask 077; mkdir -p "$(dirname "$1")"; cat > "$1"','clipboard',helper],
+                           data=(self.runtime/'scripts/macos-clipboard.jxa').read_bytes())
         host=module.call(False,'read'); guest=module.call(True,'read')
         require('items' in host and 'items' in guest,'Cannot safely preserve clipboard; finish manually after clearing confidential clipboard entries')
         # Stop the bridge to test each endpoint without a polling race; restore then re-enable.
@@ -333,6 +438,7 @@ class Workstation:
         return {'host_proxy_present':True,'exit_distinct':True}
 
     def accept(self):
+        self.desktop_preflight()
         self.invalidate();self.prerequisites();self.render();self.proxy()
         uid=self.identity();report={'guest':uid,'fingerprint':self.fingerprint(),'time':time.time()}
         self.checked_guest(['sudo','-n','/usr/local/libexec/us-workstation/control','start'])
@@ -351,6 +457,7 @@ class Workstation:
         report=json.loads((self.state/'system-checks.json').read_text())
         require(report['guest']==self.identity() and report['fingerprint']==self.fingerprint() and time.time()-report['time']<3600,
                 'System checks missing, stale or for another configuration/guest')
+        self.desktop_preflight()
         report['final_host_comparison']=self.host_comparison();report['final_firewall']=self.firewall()
         report['final_network']=self.network();report['browser']=self.browser();report['clipboard']=self.clipboard()
         private_json(self.state/'pending-ui.json',report)
@@ -387,7 +494,7 @@ def main():
     require((w.lima/w.c['profile']).is_dir(),'No such managed instance')
     try:
         w.prerequisites();w.render()
-        if cmd=='install-network':w.invalidate();w.proxy();w.script('macos-network-stage.py','--open');return
+        if cmd=='install-network':w.invalidate();w.proxy();print(w.script('macos-network-stage.py','--open').decode().strip());return
         if cmd=='accept':w.accept();return
         if cmd=='finish-acceptance':w.finish();return
         if cmd=='confirm-ui':
@@ -403,6 +510,8 @@ def main():
             r=subprocess.run([w.c['limactl'],'shell','--workdir','/',w.c['profile'],*args.guest_args],env=w.env)
             raise SystemExit(r.returncode)
         print('Mandatory current network gate passed.')
+    except PreparationRequired:
+        raise
     except (Exception, KeyboardInterrupt):
         w.quarantine();raise
 

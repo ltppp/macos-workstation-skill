@@ -24,15 +24,15 @@ description: 创建、维护和重建 Apple Silicon 上的独立 macOS 虚拟机
 python3 scripts/workstation.py --config /absolute/private/profile.json validate
 ```
 
-- **新建**：`bootstrap` → 用户在客户机安装终端输入管理员密码 → 验证安装完成 → `accept` → 登录客户机桌面 → `finish-acceptance` → 用户确认真实双向剪贴板 → `confirm-ui`。
+- **新建**：`bootstrap` → 用户在客户机安装终端输入管理员密码 → 验证安装完成、安装 Chrome 并登录桌面 → `accept` → 登录客户机桌面 → `finish-acceptance` → 用户确认真实双向剪贴板 → `confirm-ui`。
 - **强制验收**：读 [验收规则](references/acceptance.md)。新建/重建、节点/端口/共享变更、软件更新都使旧验收失效。每次 `start`、`shell`、`check` 再检查当前网络；失败时命令不放行。
-- **重建/回退**：先读 [重建](references/rebuild.md)。`rebuild --from-config OLD` 使用新 profile/端口/磁盘；旧实例保留，先验收后切换。不能使用“删除再创建同名实例”的流程。
+- **重建/回退（本版本不交付、不验收）**：历史入口见 [重建](references/rebuild.md)。`rebuild --from-config OLD` 使用新 profile/端口/磁盘；旧实例保留，先验收后切换。不能使用“删除再创建同名实例”的流程。
 - **共享与剪贴板**：读 [维护](references/maintenance.md)。目录共享必须验证真实读写；不让跨共享边界的宿主软链接冒充共享。共享文件锁有已知限制。
 
 ## 操作准则
 
 1. 检查宿主架构、依赖官方来源与校验值、可用磁盘和已运行实例。不得读取账号密码、浏览器历史或旧认证数据来“恢复环境”。
-2. `validate` 只检查配置结构；`bootstrap` 才校验依赖、创建独立磁盘并打开安装终端。首次系统安装尚无客户机 PF 保护，见安装文档中的明确限制；这时不得安排业务登录。
+2. `validate` 只检查配置结构；`bootstrap` 才校验依赖、镜像、磁盘和端口，创建独立磁盘并打开安装终端；中断后按安装文档使用同命令安全续跑，不删除磁盘。首次系统安装尚无客户机 PF 保护，见安装文档中的明确限制；这时不得安排业务登录。
 3. 管理员密码由用户在宿主/客户机系统窗口输入。不要在 SSH 图形授权持续失败时反复请求同一操作；改用客户机 Terminal。
 4. `accept` 会短暂断网、正常冷重启，只对已授权的新候选或维护窗口运行。已有业务实例先说明影响。
 5. `finish-acceptance` 需要用户已登录桌面且安装普通 Google Chrome，页面不申请媒体权限。它验证浏览器 HTTPS、两台 STUN、WebGL 与剪贴板端点。用户实际复制粘贴通过后才能执行 `confirm-ui`，不能用自动检查代替用户确认。

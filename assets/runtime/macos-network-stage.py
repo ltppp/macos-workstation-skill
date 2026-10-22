@@ -79,7 +79,8 @@ exit "$result"
         raise RuntimeError('Guest configuration check failed; output suppressed.')
     print('stage=ready; binary_hash=verified; node_secrets_copied=false')
     if args.open:
-        subprocess.run(VM + ['open', '-a', 'Terminal', STAGE + '/Install-Network.command'], check=True)
+        opened = subprocess.run(VM + ['open', '-a', 'Terminal', STAGE + '/Install-Network.command'], capture_output=True)
+        print('installer_terminal=opened' if opened.returncode == 0 else 'installer_terminal=desktop-login-required; rerun install-network after login')
 
 
 if __name__ == '__main__':

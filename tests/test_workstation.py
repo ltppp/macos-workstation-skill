@@ -1,4 +1,5 @@
 import copy
+from contextlib import ExitStack
 import importlib.util
 import json
 import os
@@ -14,10 +15,10 @@ w=importlib.util.module_from_spec(spec);spec.loader.exec_module(w)
 
 class WorkstationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.tmp=tempfile.TemporaryDirectory(dir="/tmp");self.addCleanup(self.tmp.cleanup)
         self.home=Path(self.tmp.name);self.patch=patch.object(Path,'home',return_value=self.home);self.patch.start();self.addCleanup(self.patch.stop)
         share=self.home/'project';share.mkdir()
-        self.c={'profile':'candidate-one','guest_user':'worker','limactl':str(self.home/'limactl'), 'limactl_sha256':'a'*64,
+        self.c={'profile':'test-a','guest_user':'worker','limactl':str(self.home/'limactl'), 'limactl_sha256':'a'*64,
                 'singbox':str(self.home/'singbox'),'singbox_sha256':'b'*64,'ipsw':str(self.home/'os.ipsw'), 'ipsw_sha256':'c'*64,
                 'node_file':str(self.home/'private/node'),'expected_exit_ipv4':'192.0.2.10','probe_port':28080,'socks_port':28081,
                 'host_proxy_probe_port':7890,'shares':[{'source':str(share),'target':'/Users/worker/work','writable':True}]}
@@ -68,7 +69,7 @@ class WorkstationTests(unittest.TestCase):
     def test_quarantine_falls_back_to_normal_stop(self):
         instance=w.Workstation(w.load(self.p));instance.render();w.private_json(instance.receipt,{'accepted':True})
         with patch.object(instance,'guest',side_effect=TimeoutError),patch.object(instance,'lima_cmd',return_value=subprocess.CompletedProcess([],0)) as stop:
-            instance.quarantine();stop.assert_called_once_with(['stop','candidate-one'],timeout=90)
+            instance.quarantine();stop.assert_called_once_with(['stop','test-a'],timeout=90)
         self.assertFalse(instance.receipt.exists())
     def test_ssh_failure_is_not_a_successful_network_block(self):
         instance=w.Workstation(w.load(self.p));instance.render()
@@ -111,5 +112,113 @@ class WorkstationTests(unittest.TestCase):
             partial={k:v for k,v in full.items() if k!=missing}
             with patch.object(instance,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(partial).encode(),b'')):
                 with self.assertRaises(RuntimeError):instance.network(True)
+
+    def test_long_socket_path_rejected_before_bootstrap(self):
+        self.c['profile']='long-profile-'+'x'*25;self.save()
+        with self.assertRaisesRegex(RuntimeError,'socket path too long'):w.Workstation(w.load(self.p))
+
+    def test_clipboard_stages_guest_helper_before_read(self):
+        instance=w.Workstation(w.load(self.p));instance.render()
+        events=[]
+        class Bridge:
+            def call(self, guest, action, **kwargs):
+                events.append(('read' if action=='read' else 'write',guest))
+                if action=='read':raise RuntimeError('intentional endpoint stop')
+        with patch.object(instance,'run',return_value=subprocess.CompletedProcess([],0,b'',b'')), patch.object(instance,'checked_guest',side_effect=lambda *a,**k:events.append(('stage',True))), patch('importlib.util.module_from_spec',return_value=Bridge()), patch('importlib.machinery.SourceFileLoader.exec_module'):
+            with self.assertRaisesRegex(RuntimeError,'intentional endpoint stop'):instance.clipboard()
+        self.assertEqual(events[0],('stage',True))
+
+    def creation_fixture(self, phase):
+        instance=w.Workstation(w.load(self.p));instance.render()
+        record={'fingerprint':instance.fingerprint(),'phase':phase}
+        w.private_json(instance.state/'creation.json',record)
+        return instance
+
+    def test_resume_staging_never_creates_or_deletes_disk(self):
+        instance=self.creation_fixture('created')
+        vm=instance.lima/self.c['profile'];vm.mkdir(parents=True)
+        disk=vm/'disk';disk.write_bytes(b'preserved')
+        with ExitStack() as stack:
+            for method in ('creation_preflight','render','proxy'):
+                stack.enter_context(patch.object(instance,method))
+            commands=stack.enter_context(patch.object(instance,'lima_cmd',return_value=subprocess.CompletedProcess([],0)))
+            stack.enter_context(patch.object(instance,'script',return_value=b'stage=ready'))
+            instance.bootstrap()
+        self.assertEqual(commands.call_args_list[0].args[0],['start','--tty=false','test-a'])
+        self.assertEqual(commands.call_count,1)
+        self.assertEqual(disk.read_bytes(),b'preserved')
+        self.assertEqual(json.loads((instance.state/'creation.json').read_text())['phase'],'staged')
+
+    def test_interrupted_create_does_not_adopt_partial_disk(self):
+        instance=self.creation_fixture('creating');(instance.lima/self.c['profile']).mkdir(parents=True)
+        with patch.object(instance,'lima_cmd') as command:
+            with self.assertRaisesRegex(RuntimeError,'interrupted'):instance.bootstrap()
+            command.assert_not_called()
+
+    def test_creation_change_cannot_resume(self):
+        instance=self.creation_fixture('created')
+        Path(self.c['node_file']).write_text('changed')
+        with self.assertRaisesRegex(RuntimeError,'changed'):instance.creation_record()
+
+    def test_bootstrap_staging_failure_stops_only_candidate_and_keeps_disk(self):
+        instance=self.creation_fixture('created');vm=instance.lima/self.c['profile'];vm.mkdir(parents=True)
+        with ExitStack() as stack:
+            for method in ('creation_preflight','render','proxy'):
+                stack.enter_context(patch.object(instance,method))
+            commands=stack.enter_context(patch.object(instance,'lima_cmd',return_value=subprocess.CompletedProcess([],0)))
+            stack.enter_context(patch.object(instance,'script',side_effect=RuntimeError('staging failed')))
+            with self.assertRaisesRegex(RuntimeError,'staging failed'):instance.bootstrap()
+        self.assertEqual([c.args[0] for c in commands.call_args_list],
+                         [['start','--tty=false','test-a'],['stop','test-a']])
+        self.assertTrue(vm.is_dir())
+        self.assertEqual(json.loads((instance.state/'creation.json').read_text())['phase'],'created')
+
+    def test_creation_preflight_refuses_low_disk_before_any_state(self):
+        instance=w.Workstation(w.load(self.p));Path(self.c['ipsw']).write_bytes(b'image')
+        with patch.object(instance,'prerequisites'),patch.object(w.shutil,'disk_usage',return_value=type('Usage',(),{'free':1})()):
+            with self.assertRaisesRegex(RuntimeError,'disk space'):instance.creation_preflight({'phase':'prepared'})
+        self.assertFalse(instance.state.exists())
+
+    def test_creation_preflight_refuses_occupied_port(self):
+        instance=w.Workstation(w.load(self.p));Path(self.c['ipsw']).write_bytes(b'image')
+        with patch.object(instance,'prerequisites'),patch.object(w.shutil,'disk_usage',return_value=type('Usage',(),{'free':100*1024**3})()),patch.object(w.socket,'socket') as sock:
+            sock.return_value.__enter__.return_value.bind.side_effect=OSError('busy')
+            with self.assertRaisesRegex(RuntimeError,'occupied'):instance.creation_preflight({'phase':'prepared'})
+        self.assertFalse(instance.state.exists())
+
+    def test_missing_desktop_retains_system_evidence(self):
+        instance=w.Workstation(w.load(self.p));instance.render()
+        evidence={'guest':'same','fingerprint':instance.fingerprint(),'time':w.time.time()}
+        w.private_json(instance.state/'system-checks.json',evidence)
+        with patch.object(instance,'identity',return_value='same'),patch.object(instance,'checked_guest',return_value=b'root'),patch.object(instance,'network') as network:
+            with self.assertRaises(w.PreparationRequired):instance.finish()
+            network.assert_not_called()
+        self.assertEqual(json.loads((instance.state/'system-checks.json').read_text()),evidence)
+
+    def test_main_preparation_failure_does_not_quarantine(self):
+        instance=self.creation_fixture('staged');(instance.lima/self.c['profile']).mkdir(parents=True)
+        with patch.object(w.sys,'argv',['workstation','--config',str(self.p),'finish-acceptance']),patch.object(w.Workstation,'prerequisites'),patch.object(w.Workstation,'finish',side_effect=w.PreparationRequired('login')),patch.object(w.Workstation,'quarantine') as quarantine:
+            with self.assertRaises(w.PreparationRequired):w.main()
+            quarantine.assert_not_called()
+
+    def test_fresh_create_failure_retains_partial_disk_and_stops(self):
+        instance=w.Workstation(w.load(self.p));vm=instance.lima/self.c['profile']
+        def command(args, **kwargs):
+            if args[0]=='create':
+                vm.mkdir(parents=True);(vm/'disk').write_bytes(b'partial')
+                return subprocess.CompletedProcess(args,1,b'',b'creation failed')
+            return subprocess.CompletedProcess(args,0,b'',b'')
+        with patch.object(instance,'creation_preflight'),patch.object(instance,'proxy'),patch.object(instance,'lima_cmd',side_effect=command) as calls:
+            with self.assertRaisesRegex(RuntimeError,'create failed'):instance.bootstrap()
+        self.assertEqual([c.args[0][0] for c in calls.call_args_list],['create','stop'])
+        self.assertEqual((vm/'disk').read_bytes(),b'partial')
+        self.assertEqual(json.loads((instance.state/'creation.json').read_text())['phase'],'creating')
+
+    def test_bootstrap_refuses_accepted_instance_without_mutation(self):
+        instance=self.creation_fixture('staged');w.private_json(instance.receipt,{'accepted':'existing'})
+        with patch.object(instance,'lima_cmd') as command:
+            with self.assertRaisesRegex(RuntimeError,'Already accepted'):instance.bootstrap()
+            command.assert_not_called()
+        self.assertEqual(json.loads(instance.receipt.read_text()),{'accepted':'existing'})
 
 if __name__=='__main__':unittest.main()
